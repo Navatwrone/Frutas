@@ -1,0 +1,168 @@
+Fruta de bloqueio atmosférico. #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Esse script faz o de processamento de dados ERA5 para cálculo de bloqueio atmosférico e criação da fruta.
+- Lê arquivos de geopotencial em 500 hPa (ERA5).
+- Faz pré-processamento (combinação de expver, reordenação de lon etc.).
+- Reduz a resolução (coarsen).
+- Salva o resultado em um arquivo temporário.
+- Calcula índices simples para identificar possível bloqueio,
+   utilizando uma seleção regional que abrange o Brasil e o Atlântico Sul,
+   e gera também uma máscara de ocorrência baseada em critérios definidos.
+- Para elaboração da fruta foi utilizado o estudo de Tibaldi e Monteni (1990).
+- Fonte: http://master.iag.usp.br/pr/ensino/sinotica/aula20/
+"""
+
+import glob
+import os
+import datetime
+import pandas as pd
+import xarray as xr
+from dask.diagnostics import ProgressBar
+from toolbox.utils import size_in_memory, clip_ds_with_shape
+from toolbox.physical_constants import GRAVITY
+from maisterlib.config_oper import ERA5PATH
+
+
+def get_era5_geop_hist():
+    """
+    Faz leitura e pré-processamento de arquivos de geopotencial (z) em 500 hPa (ERA5),
+    para todo o globo, com posterior coarsen (10x10).
+
+    Retorna
+    -------
+    ds : xarray.DataArray
+        Dados de geopotencial (500 hPa) global, já coarsen, e salvos em um arquivo
+        intermediário caso não exista. Caso o arquivo exista, carrega-o diretamente.
+    """
+    def preproc_ERA5T(ds):
+        # Alguns arquivos ERA5 trazem duas expver (1 e 5).
+        # Precisamos combiná-las corretamente:
+        if 'expver' in ds.dims:
+            ds1 = ds.sel(expver=1)
+            ds5 = ds.sel(expver=5)
+            ds = ds1.combine_first(ds5)
+        return ds
+
+    tempfolder = '/mnt/projects/data/temp_files/'  # TODO: ajustar em um config
+    date_today = datetime.datetime.today().strftime('%d-%m-%Y')
+    filename = f'geop_global_{date_today}.nc'
+    full_path = os.path.join(tempfolder, filename)
+
+    # Se o arquivo intermediário não existe, cria.
+    if not os.path.isfile(full_path):
+        ncpath_geop = os.path.join(ERA5PATH, 'global', 'geop')
+        filepaths_geop = glob.glob(os.path.join(ncpath_geop, '*.nc'))
+        filepaths_geop.sort()
+
+        # Abrindo múltiplos arquivos (open_mfdataset) e selecionando variável 'z'
+        ds = xr.open_mfdataset(filepaths_geop, preprocess=preproc_ERA5T)['z']
+        ds = ds.sel(level=500).drop_vars('level')  # Mantém apenas nível 500
+        ds = ds.chunk({'lat': 100, 'lon': 100})
+
+        size_in_memory(ds)  # Info de tamanho para debug/log
+
+        # Ajustando coordenadas de longitude de 0-360 para -180 a 180
+        ds = ds.assign_coords(lon=((ds.coords['lon'] + 180) % 360) - 180)
+        ds = ds.sortby('lon')
+        ds = ds.sortby('lat')
+
+        size_in_memory(ds)  # Info de tamanho para debug/log
+
+        # Faz coarsen (reduzindo resolução para 10x10)
+        ds = ds.coarsen(lat=10, lon=10, boundary='trim').mean()
+        print("Após coarsen:", ds)
+
+        # Carrega efetivamente (realiza compute) para então salvar
+        with ProgressBar():
+            ds = ds.load(num_workers=10)
+
+        ds.to_netcdf(full_path)
+        print(f"Arquivo salvo em: {full_path}")
+    else:
+        ds = xr.open_dataarray(full_path)
+
+    return ds
+
+
+def bloqueio(tmp_path, bar_path, **kwargs):
+    """
+    Essa função calcula índices simples relacionados a bloqueio atmosférico em uma região que abrange
+    o Brasil e o Atlântico Sul, utilizando bandas latitudinais definidas a partir dessa região.
+    Além da intensidade (gradiente GHGN, ou GHGS), também gera uma máscara booleana de ocorrência
+    do bloqueio com base em critérios específicos descrito no artigo http://master.iag.usp.br/pr/ensino/sinotica/aula20/
+    """
+    # selecionando a região que abrange o Brasil e parte do Atlântico Sul, temos:
+    reg_lat = slice(-45, 10)
+    reg_lon = slice(-80, -30)
+
+    # Carrega dados de geopotencial
+    ds = get_era5_geop_hist()
+    # Converte geopotencial (m^2/s^2) em metros geopotenciais (m)
+    ds = ds / GRAVITY
+    ds = ds.interp(lat=ds['lat'].values, lon=ds['lon'].values, method='linear')
+    ds = ds.sel(lat=reg_lat, lon=reg_lon)
+
+    # Definindo centros para as bandas latitudinais com base nos pontos disponíveis:
+    lat_n = -1    # para a banda norte: valor mais alto
+    lat_0 = -21   # para a banda central: valor intermediário
+    lat_s = -41   # para a banda sul: valor mais baixo
+    delta_lat = 5 # o artigo considera deltas equivalentes de 2, ou 5
+
+    # definindo os intervalos para cada banda, temos:
+    latitude_bands = {
+        'north':  {'lat': slice(lat_n - delta_lat, lat_n + delta_lat)},   # slice(-6, 4)
+        'centre': {'lat': slice(lat_0 - delta_lat, lat_0 + delta_lat)},     # slice(-26, -16)
+        'south':  {'lat': slice(lat_s - delta_lat, lat_s + delta_lat)},     # slice(-46, -36)
+    }
+
+    # Na seleção de longitude na redução final, usamos a mesma região:
+    lon_w = -80
+    lon_e = -30
+
+    # Separa bandas latitudinais conforme definido
+    ds_n = ds.sel(**latitude_bands['north'])
+    ds_0 = ds.sel(**latitude_bands['centre'])
+    ds_s = ds.sel(**latitude_bands['south'])
+
+    # Cálculo dos gradientes verticais simples entre as bandas:
+    GHGN = (ds_0.values - ds_n.values) / (lat_0 - lat_n)
+    GHGN = ds_0.copy(data=GHGN)
+    GHGS = (ds_s.values - ds_0.values) / (lat_s - lat_0)
+    GHGS = ds_0.copy(data=GHGS)
+
+    # Reduz ao longo da dimensão 'lat' e seleciona a longitude dentro do intervalo definido
+    GHGN = GHGN.max('lat').sel(lon=slice(lon_w, lon_e)).max('lon')
+    GHGS = GHGS.min('lat').sel(lon=slice(lon_w, lon_e)).min('lon')
+
+    '''
+        A fruta retorna tanto os gradientes de GHGN E GHGN (descomente a linha 164), 
+        quanto a variável de ocorrência de bloqueio (máscara booleana):
+            - Retorna 1 caso tenha ocorrido bloqueio.
+            - Retorna 0 caso não tenha ocorrido bloqueio.
+            - O período de análise varia entre 1950 e 2025.
+    '''
+
+    # Criação da máscara de ocorrência do bloqueio:
+    # Define True se GHGN > 0 e GHGS < 10; caso contrário, False.
+    da_occurrence = GHGN.where(GHGN > 0, False)
+    da_occurrence = da_occurrence.where(da_occurrence == False, True)
+    da_occurrence = da_occurrence.where(GHGS < 10, False)
+
+    # Combina a intensidade (GHGN) e a ocorrência (máscara) em um único DataArray
+    da_bloqueio = xr.concat([GHGN, da_occurrence],
+                             dim=pd.Index(['intensity', 'occurrence'], name='variavel'))
+
+    # da_bloqueio = xr.concat([GHGN, GHGS], dim=pd.Index(['GHGN', 'GHGS'], name='variavel'))
+
+    print(f"Salvando resultados de bloqueio em: {tmp_path}")
+    da_bloqueio.to_netcdf(tmp_path)
+
+
+if __name__ == '__main__':
+
+    tmp_path = '/home/marcos/bloqueio_intensidade_teste.nc'
+    bar_path = '/mnt/projects/data/bar/'
+    bloqueio(tmp_path, bar_path)
+    print("Processo concluído.")
